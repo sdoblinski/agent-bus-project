@@ -2,17 +2,20 @@
 
 Projeto demonstrativo de um barramento leve para comunicação entre agentes. Inclui:
 - `bus.py` (FastAPI) — servidor do barramento;
-- `worker_agent.py` — agente meteorologista que usa MCP + Google GenAI;
+- `worker_agent.py` — agente meteorologista com memória cognitiva (curto e longo prazo) que usa MCP + Google GenAI;
 - `interface_agent.py` — cliente de chat simples para interação humana.
 
-[Conheça os detalhes de arquitetura aqui.](ARCHITECTURE.md)
+## 📄 Documentação técnica
+- [Arquitetura do sistema](docs/ARCHITECTURE.md)
+- [Memória Cognitiva e RAG](docs/COGNITIVEMEMORY.md)
 
-**Stack (resumo)**:
+
+## 🔧 Stack
 - Python >= 3.11
 - FastAPI + Uvicorn + Pydantic
 - MCP (Model Context Protocol) para exposição de ferramentas ao LLM
 - Google GenAI (Gemini) via `google-genai`
-- Infra local: `uv`, `honcho`, `taskipy`, `python-dotenv`
+- Infra local e Dados: `uv`, `honcho`, `taskipy`, `python-dotenv`, `chromadb` (Banco Vetorial)
 
 ---
 
