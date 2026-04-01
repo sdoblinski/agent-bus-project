@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "aio-pika>=9.6.2",
     "chromadb>=1.5.5",
     "fastapi>=0.135.2",
     "google-genai>=1.69.0",
@@ -21,8 +22,14 @@ dev = [
 ]
 
 [tool.taskipy.tasks]
-# Sobe toda a infraestrutura de IA de uma vez só (AgentBus + MCP + Worker)
-dev = "honcho start"
+# Sobe o docker em background e depois inicia os agentes com honcho
+dev = "docker compose up -d && honcho start"
+
+# Atalho para ver o painel do Rabbit no navegador
+rabbit-ui = "python -m webbrowser http://localhost:15672"
+
+# Para tudo, inclusive o docker
+stop = "honcho stop; docker compose down"
 
 # Abre o chat para você conversar com a rede
 chat = "python interface_agent.py"

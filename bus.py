@@ -1,85 +1,126 @@
-# bus.py
-import uvicorn
+import asyncio
+import json
+import aio_pika
+from contextlib import asynccontextmanager
+from aio_pika.exceptions import QueueEmpty
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from typing import List, Dict
-from datetime import datetime
-import uuid
+from pydantic import BaseModel
 
-# Inicializamos o app FastAPI
-app = FastAPI(title="AgentBus", description="Barramento de mensagens leve para Sistemas Multi-Agentes")
-
-# --- MODELOS DE DADOS (Pydantic) ---
-class MessagePayload(BaseModel):
-    """Payload recebido quando um agente quer enviar uma mensagem."""
-    sender: str = Field(..., description="ID do agente que está enviando")
-    target: str = Field(..., description="ID do agente de destino")
-    content: str = Field(..., description="Conteúdo da mensagem ou tarefa")
+# Configurações do RabbitMQ
+RABBITMQ_URL = "amqp://guest:guest@localhost/"
+EXCHANGE_NAME = "agents_exchange"
+DLX_NAME = "agents_dlx"  # Dead Letter Exchange
 
 class Message(BaseModel):
-    """Estrutura interna da mensagem armazenada no barramento."""
-    id: str
     sender: str
     target: str
     content: str
-    timestamp: str
 
-# --- ESTADO EM MEMÓRIA ---
-# Dicionário onde a chave é o ID do agente (target) e o valor é uma lista de mensagens (fila)
-# Exemplo: {"meteorologista": [Msg1, Msg2], "atendente": [Msg3]}
-message_queues: Dict[str, List[Message]] = {}
-
-
-# --- ENDPOINTS DA API ---
-
-@app.post("/send", summary="Envia uma mensagem para o barramento")
-async def send_message(payload: MessagePayload):
-    """Recebe uma mensagem de um agente e a coloca na fila do agente de destino."""
+async def setup_rabbitmq():
+    """
+    Configura a infraestrutura inicial do RabbitMQ com lógica de retentativa.
+    """
+    retries = 5
+    connection = None
     
-    # Cria o objeto da mensagem com ID único e timestamp
-    new_message = Message(
-        id=str(uuid.uuid4()),
-        sender=payload.sender,
-        target=payload.target,
-        content=payload.content,
-        timestamp=datetime.now().isoformat()
-    )
-    
-    # Se a fila do agente de destino não existir, criamos uma nova
-    if payload.target not in message_queues:
-        message_queues[payload.target] = []
-        
-    # Adicionamos a mensagem na fila correta
-    message_queues[payload.target].append(new_message)
-    
-    print(f"[BUS] Nova mensagem: {payload.sender} -> {payload.target}")
-    return {"status": "success", "message_id": new_message.id}
+    while retries > 0:
+        try:
+            # Tenta estabelecer a conexão robusta
+            connection = await aio_pika.connect_robust(RABBITMQ_URL)
+            channel = await connection.channel()
 
+            # 1. Criar a Dead Letter Exchange e Fila (DLQ)
+            dlx_exchange = await channel.declare_exchange(DLX_NAME, aio_pika.ExchangeType.TOPIC)
+            dlq_queue = await channel.declare_queue("dead_letter_queue", durable=True)
+            await dlq_queue.bind(dlx_exchange, routing_key="#")
 
-@app.get("/poll/{agent_id}", response_model=List[Message], summary="Lê e consome mensagens de um agente")
+            # 2. Criar a Exchange principal
+            main_exchange = await channel.declare_exchange(EXCHANGE_NAME, aio_pika.ExchangeType.TOPIC)
+
+            # 3. Criar a fila global para o Worker
+            await channel.declare_queue(
+                "tasks.meteorologist",
+                durable=True,
+                arguments={
+                    "x-dead-letter-exchange": DLX_NAME,
+                    "x-dead-letter-routing-key": "tasks.failed"
+                }
+            )
+            
+            # Vincula a fila do worker para ouvir mensagens do tipo 'meteorologist'
+            worker_queue = await channel.get_queue("tasks.meteorologist")
+            await worker_queue.bind(main_exchange, routing_key="meteorologist")
+
+            print("✅ Conectado ao RabbitMQ e infraestrutura configurada!")
+            return connection, main_exchange
+
+        except Exception as e:
+            retries -= 1
+            print(f"⏳ Aguardando RabbitMQ ficar online... ({retries} tentativas restantes)")
+            if retries == 0:
+                print(f"❌ Erro fatal ao conectar no RabbitMQ: {e}")
+                raise e
+            await asyncio.sleep(3)
+
+# Estado global para manter a conexão ativa
+rabbit_connection = None
+agents_exchange = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Gerenciador de ciclo de vida: Substitui o startup e shutdown.
+    """
+    global rabbit_connection, agents_exchange
+    # Lógica de Inicialização (Startup)
+    rabbit_connection, agents_exchange = await setup_rabbitmq()
+    
+    yield  # A aplicação roda aqui
+    
+    # Lógica de Encerramento (Shutdown)
+    if rabbit_connection:
+        await rabbit_connection.close()
+        print("🛑 Conexão com RabbitMQ encerrada.")
+
+app = FastAPI(lifespan=lifespan)
+
+@app.post("/send")
+async def send_message(msg: Message):
+    """Envia a mensagem para a Exchange usando o target como routing_key."""
+    try:
+        await agents_exchange.publish(
+            aio_pika.Message(
+                body=msg.model_dump_json().encode(),
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT
+            ),
+            routing_key=msg.target
+        )
+        return {"status": "sent", "routing_key": msg.target}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/poll/{agent_id}")
 async def poll_messages(agent_id: str):
-    """
-    Agentes chamam este endpoint para ver se há mensagens para eles.
-    Ao ler as mensagens, elas são removidas da fila (consumidas).
-    """
-    # Se não houver fila para o agente ou ela estiver vazia, retorna lista vazia
-    if agent_id not in message_queues or not message_queues[agent_id]:
-        return []
-    
-    # Pega todas as mensagens da fila
-    messages_to_deliver = message_queues[agent_id]
-    
-    # Limpa a fila (já que as mensagens foram "entregues")
-    message_queues[agent_id] = []
-    
-    if messages_to_deliver:
-        print(f"[BUS] Entregando {len(messages_to_deliver)} mensagem(ns) para {agent_id}")
-        
-    return messages_to_deliver
+    """Lógica de polling que consome do RabbitMQ tratando fila vazia."""
+    async with rabbit_connection.channel() as channel:
+        # Declara a fila
+        queue = await channel.declare_queue(f"tasks.{agent_id}", auto_delete=True)
+        await queue.bind(agents_exchange, routing_key=agent_id)
 
+        messages = []
+        try:
+            while len(messages) < 10:
+                try:
+                    msg = await queue.get(no_ack=False, fail=True)
+                    messages.append(json.loads(msg.body.decode()))
+                    await msg.ack()
+                except QueueEmpty:
+                    break
+        except Exception as e:
+            print(f"❌ Erro ao processar fila: {e}")
+            
+        return messages
 
-# --- EXECUÇÃO ---
 if __name__ == "__main__":
-    # Roda o servidor na porta 8000
-    print("Iniciando AgentBus na porta 8000...")
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,0 +1,10 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: agentbus-rabbit
+    ports:
+      - "5672:5672"   # Porta do protocolo AMQP (para os agentes)
+      - "15672:15672" # Porta da interface web (http://localhost:15672)
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
